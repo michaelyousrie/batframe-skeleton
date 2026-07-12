@@ -6,7 +6,7 @@
     "keywords": ["batframe", "skeleton", "starter", "template", "microframework"],
     "require": {
         "php": "^8.1",
-        "michaelyousrie/batframe": "^0.2"
+        "michaelyousrie/batframe": "*"
     },
     "autoload": {
         "psr-4": {
