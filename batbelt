@@ -1,0 +1,1015 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use App\App;
+use Batframe\Routing\RouteResolver;
+
+/**
+ * Batbelt: your project's command line tool.
+ *
+ * It works the way Batframe works. Batframe turns the public methods of your App
+ * class into HTTP routes; Batbelt turns the public methods of the Batbelt class
+ * below into commands, and binds their typed parameters to arguments the same way
+ * Batframe binds them to path segments. There is no command table to author.
+ *
+ * Adding a command means adding a public method. That is the whole extension seam.
+ *
+ * The Batbelt class comes first because it is the part you edit. The engine that
+ * drives it (class Belt) is underneath, and you can ignore it.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+
+    exit('batbelt is a command line tool.');
+}
+
+$autoload = __DIR__ . '/vendor/autoload.php';
+
+if (!is_file($autoload)) {
+    fwrite(STDERR, PHP_EOL . '  Dependencies are missing. Run `composer install` first.' . PHP_EOL . PHP_EOL);
+
+    exit(1);
+}
+
+require $autoload;
+
+/**
+ * Your commands.
+ *
+ * Every public method here is a command, named exactly as the method is named:
+ * `serve()` is `php batbelt serve`, `makeRoute()` is `php batbelt makeRoute`. If
+ * you want a command called something else, name the method that.
+ *
+ * Parameters become arguments. One without a default is positional, in declared
+ * order; one with a default becomes an optional `--flag` seeded from that default.
+ * The declared type does the casting, so a bad value is a clean error rather than
+ * a TypeError.
+ *
+ * The first line of a method's docblock is its description in `php batbelt`, and
+ * its `@param` lines describe the arguments in `php batbelt <command> --help`.
+ *
+ * Private methods are helpers, never commands. Neither are the engine's own
+ * methods, because they are declared on Belt.
+ */
+final class Batbelt extends Belt
+{
+    /**
+     * Start the development server.
+     *
+     * @param string $host Interface to bind to.
+     * @param int    $port Port to listen on. 1939, the year Batman first appeared.
+     */
+    public function serve(string $host = 'localhost', int $port = 1939): int
+    {
+        $docroot = $this->root('public');
+
+        if (!is_dir($docroot)) {
+            $this->error('There is no public/ directory to serve.');
+
+            return 1;
+        }
+
+        if ($this->portIsTaken($host, $port)) {
+            $this->error(sprintf('Port %d is already in use. Try --port=%d.', $port, $port + 1));
+
+            return 1;
+        }
+
+        $this->line();
+        $this->line('  ' . $this->paint(sprintf('http://%s:%d', $host, $port), 'cyan') . $this->paint('  (ctrl-c to stop)', 'dim'));
+        $this->line();
+
+        // PHP_BINARY re-invokes this same interpreter, which is what keeps the
+        // tool dependency-free. No router script is needed: the built-in server
+        // already falls back up the tree to public/index.php.
+        return $this->run(PHP_BINARY, '-S', $host . ':' . $port, '-t', $docroot);
+    }
+
+    /**
+     * Start the development server. Does the same thing as serve.
+     */
+    public function server(string $host = 'localhost', int $port = 1939): int
+    {
+        return $this->serve($host, $port);
+    }
+
+    /**
+     * List every route your app resolves.
+     */
+    public function routes(): int
+    {
+        // Resolving the class name rather than an instance keeps this read-only:
+        // no constructor, no environment loading, no cache directories created.
+        $routes = (new RouteResolver())->resolve(App::class);
+
+        if ($routes === []) {
+            $this->line();
+            $this->line('  No routes yet. Add a verb-prefixed public method to src/App.php or a trait in src/Routes/.');
+            $this->line();
+
+            return 0;
+        }
+
+        usort($routes, static fn ($a, $b): int => [$a->path, $a->verb] <=> [$b->path, $b->verb]);
+
+        $rows = [['VERB', 'PATH', 'HANDLER']];
+
+        foreach ($routes as $route) {
+            $rows[] = [$route->verb, $route->path, $route->handler . '()'];
+        }
+
+        $this->line();
+        $this->table($rows);
+        $this->line();
+
+        return 0;
+    }
+
+    /**
+     * Scaffold a route trait in src/Routes/ and wire it into your app.
+     *
+     * @param string $name  Resource name, e.g. Product.
+     * @param bool   $force Overwrite the trait if it already exists.
+     */
+    public function makeRoute(string $name, bool $force = false): int
+    {
+        $trait = $this->traitName($name);
+        $path = $this->root('src', 'Routes', $trait . '.php');
+
+        if (is_file($path) && !$force) {
+            $this->error(sprintf('src/Routes/%s.php already exists. Use --force to overwrite it.', $trait));
+
+            return 1;
+        }
+
+        $this->put($path, $this->routeStub($trait));
+
+        $this->line();
+        $this->wrote('created', 'src/Routes/' . $trait . '.php');
+
+        if ($this->wireIntoApp($trait)) {
+            $this->wrote('updated', 'src/App.php');
+            $this->line();
+            $this->line($this->paint('  php batbelt routes  to see it.', 'dim'));
+            $this->line();
+
+            return 0;
+        }
+
+        $this->line();
+        $this->line('  Add these two lines to src/App.php yourself:');
+        $this->line();
+        $this->line($this->paint('    use App\Routes\\' . $trait . ';', 'cyan') . $this->paint('   (with the other imports)', 'dim'));
+        $this->line($this->paint('    use ' . $trait . ';', 'cyan') . $this->paint('   (inside the class)', 'dim'));
+        $this->line();
+
+        return 0;
+    }
+
+    /**
+     * Scaffold a static page in pages/.
+     *
+     * @param string $name  Page name, e.g. pricing. It will be served at /pricing.
+     * @param bool   $force Overwrite the page if it already exists.
+     */
+    public function makePage(string $name, bool $force = false): int
+    {
+        // Also rejects slashes and dots, so a name can never escape pages/.
+        if (preg_match('/^[A-Za-z0-9_-]+$/', $name) !== 1) {
+            throw new BeltError('A page name may only contain letters, numbers, hyphens and underscores.');
+        }
+
+        $name = strtolower($name);
+        $path = $this->root('pages', $name . '.blade.php');
+
+        if (is_file($path) && !$force) {
+            $this->error(sprintf('pages/%s.blade.php already exists. Use --force to overwrite it.', $name));
+
+            return 1;
+        }
+
+        $this->put($path, $this->pageStub($name));
+
+        $this->line();
+        $this->wrote('created', 'pages/' . $name . '.blade.php');
+        $this->line();
+        $this->line($this->paint('  It is live at /' . $name . '. No route needed.', 'dim'));
+        $this->line();
+
+        return 0;
+    }
+
+    /**
+     * Clear compiled views and cached data.
+     */
+    public function clearCache(): int
+    {
+        $cache = $this->cacheDirectory();
+        $root = realpath(__DIR__);
+        $real = realpath($cache);
+
+        if ($real === false) {
+            $this->line();
+            $this->line('  Nothing to clear.');
+            $this->line();
+
+            return 0;
+        }
+
+        // BladeOne compiles views to the cache root itself and the file cache
+        // lives in data/ underneath it, so this empties the directory rather
+        // than removing a subdirectory. Which makes the guard worth having: a
+        // misconfigured `cache` path must never point this at something else.
+        if ($root === false || !str_starts_with($real, $root . DIRECTORY_SEPARATOR)) {
+            $this->error(sprintf('Refusing to clear "%s". It is outside the project.', $cache));
+
+            return 1;
+        }
+
+        $removed = $this->purge($real);
+
+        $this->line();
+        $this->line(sprintf('  Cleared %d %s from %s.', $removed, $removed === 1 ? 'file' : 'files', $this->relative($real)));
+        $this->line();
+
+        return 0;
+    }
+
+    // ------------------------------------------------------------------------------
+    // Private helpers below here. Commands are above.
+    // ------------------------------------------------------------------------------
+
+    /**
+     * Where the app keeps its cache. Asking the app beats hardcoding
+     * storage/cache, since the path is configurable.
+     */
+    private function cacheDirectory(): string
+    {
+        try {
+            return (new App())->cachePath();
+        } catch (Throwable) {
+            return $this->root('storage', 'cache');
+        }
+    }
+
+    private function portIsTaken(string $host, int $port): bool
+    {
+        $connection = @fsockopen($host, $port, $code, $message, 0.5);
+
+        if ($connection === false) {
+            return false;
+        }
+
+        fclose($connection);
+
+        return true;
+    }
+
+    private function traitName(string $name): string
+    {
+        if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+            throw new BeltError(sprintf('"%s" is not a valid PHP name.', $name));
+        }
+
+        $name = ucfirst($name);
+
+        return str_ends_with($name, 'Routes') ? $name : $name . 'Routes';
+    }
+
+    /**
+     * Add the trait's import and its `use` to src/App.php, both in sorted
+     * position. Returns false when the file does not look the way we expect,
+     * in which case the caller prints the lines instead of guessing.
+     */
+    private function wireIntoApp(string $trait): bool
+    {
+        $path = $this->root('src', 'App.php');
+
+        if (!is_file($path)) {
+            return false;
+        }
+
+        $source = (string) file_get_contents($path);
+        $eol = str_contains($source, "\r\n") ? "\r\n" : "\n";
+
+        if (preg_match('/^[ \t]+use\s+' . preg_quote($trait, '/') . '\s*;/m', $source) === 1) {
+            return true;
+        }
+
+        $imported = $this->insertSorted($source, '/^use\s+App\\\\Routes\\\\\w+\s*;/m', 'use App\Routes\\' . $trait . ';', $eol);
+
+        if ($imported === null) {
+            return false;
+        }
+
+        // Top-level imports carry backslashes, which \w+ excludes, so this only
+        // ever matches the trait `use` lines inside the class body.
+        $wired = $this->insertSorted($imported, '/^[ \t]+use\s+\w+\s*;/m', '    use ' . $trait . ';', $eol);
+
+        if ($wired === null) {
+            return false;
+        }
+
+        return @file_put_contents($path, $wired) !== false;
+    }
+
+    /**
+     * Insert $line among the lines matching $pattern, keeping them sorted.
+     * Returns null when there is nothing matching to anchor against.
+     */
+    private function insertSorted(string $source, string $pattern, string $line, string $eol): ?string
+    {
+        if (preg_match_all($pattern, $source, $matches, PREG_OFFSET_CAPTURE) < 1) {
+            return null;
+        }
+
+        foreach ($matches[0] as [$text, $offset]) {
+            if (strcmp(trim($text), trim($line)) > 0) {
+                return substr($source, 0, $offset) . $line . $eol . substr($source, $offset);
+            }
+        }
+
+        [$text, $offset] = $matches[0][count($matches[0]) - 1];
+        $at = $offset + strlen($text);
+
+        return substr($source, 0, $at) . $eol . $line . substr($source, $at);
+    }
+
+    private function routeStub(string $trait): string
+    {
+        $resource = substr($trait, 0, -strlen('Routes'));
+
+        $stub = <<<'PHP'
+            <?php
+
+            declare(strict_types=1);
+
+            namespace App\Routes;
+
+            /**
+             * {{resource}} routes. Every verb-prefixed public method here becomes an
+             * endpoint, with the path inferred from the method name.
+             */
+            trait {{trait}}
+            {
+                /** GET /{{path}} */
+                public function get{{resource}}(): array
+                {
+                    return [];
+                }
+            }
+
+            PHP;
+
+        return strtr($stub, [
+            '{{trait}}' => $trait,
+            '{{resource}}' => $resource,
+            '{{path}}' => strtolower($resource),
+        ]);
+    }
+
+    private function pageStub(string $name): string
+    {
+        $stub = <<<'BLADE'
+            @extends('layouts.app')
+
+            @section('title', '{{title}}')
+
+            @section('content')
+                <h1>{{title}}</h1>
+                <p>This page has no controller method. It lives at
+                <code>pages/{{name}}.blade.php</code> and is served automatically.</p>
+                <p><a href="/">Back home</a></p>
+            @endsection
+
+            BLADE;
+
+        return strtr($stub, [
+            '{{title}}' => ucfirst(str_replace(['-', '_'], ' ', $name)),
+            '{{name}}' => $name,
+        ]);
+    }
+}
+
+/**
+ * The engine. It reflects the commands off the class above, binds argv to their
+ * parameters, and prints help. Nothing here is a command: these methods are
+ * declared on Belt, which is exactly how Batframe's RouteResolver keeps the
+ * framework's own methods from becoming routes.
+ */
+abstract class Belt
+{
+    /**
+     * Run a command and return its exit code.
+     */
+    public function handle(array $argv): int
+    {
+        array_shift($argv);
+        $name = array_shift($argv);
+        $command = null;
+
+        try {
+            if ($name === null || $this->isHelp($name)) {
+                return $this->help($argv);
+            }
+
+            $command = $this->command($name);
+
+            if ($command === null) {
+                return $this->unknown($name);
+            }
+
+            foreach ($argv as $argument) {
+                if ($this->isHelp($argument)) {
+                    $this->usage($command);
+
+                    return 0;
+                }
+            }
+
+            $result = $command->invoke($this, ...$this->bind($command, $argv));
+
+            return is_int($result) ? $result : 0;
+        } catch (BeltError $error) {
+            $this->error($error->getMessage());
+
+            if ($command !== null) {
+                $this->usage($command);
+            }
+
+            return 1;
+        }
+    }
+
+    /**
+     * Run a program and stream its output. Arguments are escaped individually,
+     * so callers never build a shell string themselves.
+     */
+    protected function run(string ...$arguments): int
+    {
+        $status = 0;
+
+        passthru(implode(' ', array_map('escapeshellarg', $arguments)), $status);
+
+        return $status;
+    }
+
+    /**
+     * An absolute path inside the project.
+     */
+    protected function root(string ...$segments): string
+    {
+        return implode(DIRECTORY_SEPARATOR, [__DIR__, ...$segments]);
+    }
+
+    protected function relative(string $path): string
+    {
+        $root = realpath(__DIR__);
+
+        if ($root !== false && str_starts_with($path, $root . DIRECTORY_SEPARATOR)) {
+            $path = substr($path, strlen($root) + 1);
+        }
+
+        return str_replace(DIRECTORY_SEPARATOR, '/', $path);
+    }
+
+    protected function line(string $message = ''): void
+    {
+        fwrite(STDOUT, $message . PHP_EOL);
+    }
+
+    protected function error(string $message): void
+    {
+        fwrite(STDERR, PHP_EOL . '  ' . $this->paint($message, 'red') . PHP_EOL);
+    }
+
+    protected function wrote(string $verb, string $path): void
+    {
+        $this->line('  ' . $this->paint($verb, 'green') . '  ' . $path);
+    }
+
+    /**
+     * @param list<list<string>> $rows The first row is treated as a header.
+     */
+    protected function table(array $rows): void
+    {
+        $widths = [];
+
+        foreach ($rows as $row) {
+            foreach (array_values($row) as $column => $cell) {
+                $widths[$column] = max($widths[$column] ?? 0, strlen($cell));
+            }
+        }
+
+        foreach ($rows as $index => $row) {
+            $line = '';
+
+            foreach (array_values($row) as $column => $cell) {
+                $line .= str_pad($cell, $widths[$column] + 2);
+            }
+
+            // Painted after padding, so the escape codes cannot skew the columns.
+            $this->line('  ' . ($index === 0 ? $this->paint(rtrim($line), 'dim') : rtrim($line)));
+        }
+    }
+
+    protected function paint(string $text, string $color): string
+    {
+        $codes = ['bold' => '1', 'dim' => '2', 'red' => '31', 'green' => '32', 'yellow' => '33', 'cyan' => '36'];
+
+        if (!isset($codes[$color]) || !$this->colours()) {
+            return $text;
+        }
+
+        return "\033[" . $codes[$color] . 'm' . $text . "\033[0m";
+    }
+
+    private function colours(): bool
+    {
+        if (getenv('NO_COLOR') !== false) {
+            return false;
+        }
+
+        return function_exists('stream_isatty') && @stream_isatty(STDOUT);
+    }
+
+    /**
+     * The commands, keyed by name.
+     *
+     * @return array<string, ReflectionMethod>
+     */
+    private function commands(): array
+    {
+        $commands = [];
+
+        foreach ((new ReflectionClass($this))->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+            if ($this->isCommand($method)) {
+                $commands[$method->getName()] = $method;
+            }
+        }
+
+        ksort($commands);
+
+        return $commands;
+    }
+
+    private function isCommand(ReflectionMethod $method): bool
+    {
+        if ($method->isStatic() || $method->isAbstract() || $method->isConstructor() || $method->isDestructor()) {
+            return false;
+        }
+
+        if (str_starts_with($method->getName(), '__')) {
+            return false;
+        }
+
+        $declaring = $method->getDeclaringClass()->getName();
+
+        return $declaring !== self::class && !is_subclass_of(self::class, $declaring);
+    }
+
+    private function command(string $name): ?ReflectionMethod
+    {
+        return $this->commands()[$name] ?? null;
+    }
+
+    /**
+     * Turn the remaining argv into the command's arguments.
+     *
+     * @return list<mixed>
+     */
+    private function bind(ReflectionMethod $command, array $argv): array
+    {
+        [$flags, $positionals] = $this->parse($argv);
+
+        $optional = [];
+
+        foreach ($command->getParameters() as $parameter) {
+            if ($parameter->isDefaultValueAvailable()) {
+                $optional[$parameter->getName()] = true;
+            }
+        }
+
+        foreach (array_keys($flags) as $flag) {
+            if (!isset($optional[$flag])) {
+                throw new BeltError(sprintf('Unknown flag --%s.', $flag));
+            }
+        }
+
+        $arguments = [];
+
+        foreach ($command->getParameters() as $parameter) {
+            $name = $parameter->getName();
+
+            if ($parameter->isVariadic()) {
+                foreach ($positionals as $value) {
+                    $arguments[] = $this->cast($value, $parameter);
+                }
+
+                $positionals = [];
+
+                continue;
+            }
+
+            if ($parameter->isDefaultValueAvailable()) {
+                $arguments[] = array_key_exists($name, $flags)
+                    ? $this->cast($flags[$name], $parameter)
+                    : $parameter->getDefaultValue();
+
+                continue;
+            }
+
+            if ($positionals === []) {
+                throw new BeltError(sprintf('Missing required argument <%s>.', $name));
+            }
+
+            $arguments[] = $this->cast(array_shift($positionals), $parameter);
+        }
+
+        if ($positionals !== []) {
+            throw new BeltError(sprintf('Unexpected argument "%s".', $positionals[0]));
+        }
+
+        return $arguments;
+    }
+
+    /**
+     * Split argv into flags and positionals. `--flag=value` carries a value,
+     * a bare `--flag` is presence, everything else is positional.
+     *
+     * @return array{array<string, string|true>, list<string>}
+     */
+    private function parse(array $argv): array
+    {
+        $flags = [];
+        $positionals = [];
+
+        foreach ($argv as $argument) {
+            if (!str_starts_with($argument, '--') || $argument === '--') {
+                $positionals[] = $argument;
+
+                continue;
+            }
+
+            $body = substr($argument, 2);
+
+            if (str_contains($body, '=')) {
+                [$key, $value] = explode('=', $body, 2);
+                $flags[$key] = $value;
+
+                continue;
+            }
+
+            $flags[$body] = true;
+        }
+
+        return [$flags, $positionals];
+    }
+
+    private function cast(string|bool $value, ReflectionParameter $parameter): mixed
+    {
+        $type = $this->typeName($parameter);
+        $label = $this->label($parameter);
+
+        if ($value === true) {
+            if ($type !== 'bool') {
+                throw new BeltError(sprintf('%s needs a value, as in %s=…', $label, $label));
+            }
+
+            return true;
+        }
+
+        switch ($type) {
+            case 'int':
+                $cast = filter_var($value, FILTER_VALIDATE_INT);
+
+                if ($cast === false) {
+                    throw new BeltError(sprintf('%s should be a whole number, but got "%s".', $label, $value));
+                }
+
+                return $cast;
+
+            case 'float':
+                $cast = filter_var($value, FILTER_VALIDATE_FLOAT);
+
+                if ($cast === false) {
+                    throw new BeltError(sprintf('%s should be a number, but got "%s".', $label, $value));
+                }
+
+                return $cast;
+
+            case 'bool':
+                $cast = filter_var($value, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
+
+                if ($cast === null) {
+                    throw new BeltError(sprintf('%s should be true or false, but got "%s".', $label, $value));
+                }
+
+                return $cast;
+
+            default:
+                return $value;
+        }
+    }
+
+    private function typeName(ReflectionParameter $parameter): string
+    {
+        $type = $parameter->getType();
+
+        return $type instanceof ReflectionNamedType ? $type->getName() : 'string';
+    }
+
+    private function label(ReflectionParameter $parameter): string
+    {
+        return $parameter->isDefaultValueAvailable()
+            ? '--' . $parameter->getName()
+            : '<' . $parameter->getName() . '>';
+    }
+
+    /**
+     * `php batbelt`, `php batbelt help`, `php batbelt help <command>`.
+     *
+     * Intercepted before command lookup, so a command named `help` would never
+     * be reached. Name one something else.
+     */
+    private function help(array $argv): int
+    {
+        $topic = array_shift($argv);
+
+        if ($topic !== null && !$this->isHelp($topic)) {
+            $command = $this->command($topic);
+
+            if ($command === null) {
+                return $this->unknown($topic);
+            }
+
+            $this->usage($command);
+
+            return 0;
+        }
+
+        $commands = $this->commands();
+        $width = max(array_map('strlen', array_keys($commands)));
+
+        $this->line();
+        $this->line('  ' . $this->paint('Batbelt', 'bold'));
+        $this->line();
+        $this->line('  Usage:  php batbelt <command> [arguments] [--flags]');
+        $this->line();
+
+        foreach ($commands as $name => $command) {
+            $this->line(sprintf('  %s  %s', str_pad($name, $width), $this->paint($this->describe($command), 'dim')));
+        }
+
+        $this->line();
+        $this->line($this->paint('  php batbelt <command> --help  for a command\'s arguments.', 'dim'));
+        $this->line();
+
+        return 0;
+    }
+
+    private function usage(ReflectionMethod $command): void
+    {
+        $description = $this->describe($command);
+
+        $this->line();
+
+        if ($description !== '') {
+            $this->line('  ' . $description);
+            $this->line();
+        }
+
+        $this->line('  Usage:  php batbelt ' . $command->getName() . $this->signature($command));
+
+        $docs = $this->paramDocs($command);
+        $arguments = [];
+        $flags = [];
+
+        foreach ($command->getParameters() as $parameter) {
+            $note = $docs[$parameter->getName()] ?? '';
+
+            if ($parameter->isDefaultValueAvailable()) {
+                $default = $this->defaultOf($parameter);
+                $flags[] = [$this->label($parameter), trim($note . ' ' . $this->paint('(default: ' . $default . ')', 'dim'))];
+
+                continue;
+            }
+
+            $arguments[] = [$this->label($parameter), $note];
+        }
+
+        foreach (['Arguments' => $arguments, 'Flags' => $flags] as $heading => $rows) {
+            if ($rows === []) {
+                continue;
+            }
+
+            $width = max(array_map(static fn (array $row): int => strlen($row[0]), $rows));
+
+            $this->line();
+            $this->line('  ' . $heading . ':');
+
+            foreach ($rows as [$name, $note]) {
+                $this->line(sprintf('    %s  %s', str_pad($name, $width), $note));
+            }
+        }
+
+        $this->line();
+    }
+
+    private function signature(ReflectionMethod $command): string
+    {
+        $signature = '';
+
+        foreach ($command->getParameters() as $parameter) {
+            $name = $parameter->getName();
+
+            if ($parameter->isVariadic()) {
+                $signature .= ' [<' . $name . '>...]';
+
+                continue;
+            }
+
+            if (!$parameter->isDefaultValueAvailable()) {
+                $signature .= ' <' . $name . '>';
+
+                continue;
+            }
+
+            $signature .= $this->typeName($parameter) === 'bool'
+                ? ' [--' . $name . ']'
+                : ' [--' . $name . '=' . $this->defaultOf($parameter) . ']';
+        }
+
+        return $signature;
+    }
+
+    private function defaultOf(ReflectionParameter $parameter): string
+    {
+        if (!$parameter->isDefaultValueAvailable()) {
+            return '';
+        }
+
+        $default = $parameter->getDefaultValue();
+
+        return match (true) {
+            $default === null => 'null',
+            $default === true => 'true',
+            $default === false => 'false',
+            is_array($default) => '[]',
+            default => (string) $default,
+        };
+    }
+
+    /**
+     * The first prose line of the docblock.
+     */
+    private function describe(ReflectionMethod $command): string
+    {
+        foreach ($this->docLines($command) as $line) {
+            if ($line !== '' && !str_starts_with($line, '@')) {
+                return $line;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * The `@param` descriptions, keyed by parameter name.
+     *
+     * @return array<string, string>
+     */
+    private function paramDocs(ReflectionMethod $command): array
+    {
+        $docs = [];
+
+        foreach ($this->docLines($command) as $line) {
+            if (preg_match('/^@param\s+\S+\s+\$(\w+)\s+(.+)$/', $line, $matches) === 1) {
+                $docs[$matches[1]] = trim($matches[2]);
+            }
+        }
+
+        return $docs;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function docLines(ReflectionMethod $command): array
+    {
+        $doc = $command->getDocComment();
+
+        if ($doc === false) {
+            return [];
+        }
+
+        $lines = [];
+
+        foreach (preg_split('/\R/', (string) preg_replace('#^\s*/\*\*|\*/\s*$#', '', $doc)) as $line) {
+            $lines[] = trim(ltrim(trim($line), '*'));
+        }
+
+        return $lines;
+    }
+
+    private function isHelp(string $argument): bool
+    {
+        return in_array($argument, ['help', '--help', '-h'], true);
+    }
+
+    private function unknown(string $name): int
+    {
+        $this->error(sprintf('Unknown command "%s".', $name));
+
+        $suggestion = $this->closest($name);
+
+        $this->line();
+
+        if ($suggestion !== null) {
+            $this->line('  Did you mean ' . $this->paint($suggestion, 'cyan') . '?');
+            $this->line();
+        }
+
+        $this->line($this->paint('  php batbelt  for the full list.', 'dim'));
+        $this->line();
+
+        return 1;
+    }
+
+    private function closest(string $name): ?string
+    {
+        $best = null;
+        $shortest = PHP_INT_MAX;
+
+        foreach (array_keys($this->commands()) as $command) {
+            $distance = levenshtein(strtolower($name), strtolower($command));
+
+            if ($distance < $shortest) {
+                $shortest = $distance;
+                $best = $command;
+            }
+        }
+
+        return $shortest <= max(2, intdiv(strlen($name), 3)) ? $best : null;
+    }
+
+    /**
+     * Write a file, creating its directory if needed.
+     */
+    protected function put(string $path, string $contents): void
+    {
+        $directory = dirname($path);
+
+        if (!is_dir($directory) && !@mkdir($directory, 0775, true) && !is_dir($directory)) {
+            throw new BeltError(sprintf('Could not create %s.', $this->relative($directory)));
+        }
+
+        if (@file_put_contents($path, $contents) === false) {
+            throw new BeltError(sprintf('Could not write %s.', $this->relative($path)));
+        }
+    }
+
+    /**
+     * Empty a directory, keeping the directory itself and any .gitkeep.
+     */
+    protected function purge(string $directory): int
+    {
+        $removed = 0;
+
+        $items = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST,
+        );
+
+        foreach ($items as $item) {
+            if ($item->getFilename() === '.gitkeep') {
+                continue;
+            }
+
+            if ($item->isDir()) {
+                @rmdir($item->getPathname());
+
+                continue;
+            }
+
+            if (@unlink($item->getPathname())) {
+                $removed++;
+            }
+        }
+
+        return $removed;
+    }
+}
+
+/**
+ * Anything a command can fail with. The message is shown to the user as-is, so
+ * write it for them, and the command's usage is printed underneath.
+ */
+final class BeltError extends RuntimeException
+{
+}
+
+exit((new Batbelt())->handle($argv));

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App;
 
 use App\Routes\PageRoutes;
-use App\Routes\UserRoutes;
 use Batframe\Batframe;
 
 /**
@@ -18,5 +17,9 @@ use Batframe\Batframe;
 class App extends Batframe
 {
     use PageRoutes;
-    use UserRoutes;
+
+    public function getUser()
+    {
+        return response()->html('hello world!');
+    }
 }
