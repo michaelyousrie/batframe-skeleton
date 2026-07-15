@@ -104,25 +104,42 @@ final class Batbelt extends Belt
         // Resolving the class name rather than an instance keeps this read-only:
         // no constructor, no environment loading, no cache directories created.
         $routes = (new RouteResolver())->resolve(App::class);
+        $entries = [];
 
-        if ($routes === []) {
+        foreach ($routes as $route) {
+            $entries[] = [$route->verb, $route->path, $route->handler . '()'];
+        }
+
+        foreach ($this->pages() as $url => $file) {
+            // A page is a fallback. The framework only reaches it when no route
+            // claims the path, and it never looks at the verb, so any verb is
+            // answered. A route on the same path makes the page dead weight.
+            $claimed = false;
+
+            foreach ($routes as $route) {
+                if ($route->match($url) !== null) {
+                    $claimed = true;
+
+                    break;
+                }
+            }
+
+            $entries[] = ['ANY', $url, $file . ($claimed ? '  (unreachable: a route claims this path)' : '')];
+        }
+
+        if ($entries === []) {
             $this->line();
-            $this->line('  No routes yet. Add a verb-prefixed public method to src/App.php or a trait in src/Routes/.');
+            $this->line('  Nothing yet. Add a verb-prefixed public method to src/App.php or a trait in');
+            $this->line('  src/Routes/, or drop a Blade file in pages/.');
             $this->line();
 
             return 0;
         }
 
-        usort($routes, static fn ($a, $b): int => [$a->path, $a->verb] <=> [$b->path, $b->verb]);
-
-        $rows = [['VERB', 'PATH', 'HANDLER']];
-
-        foreach ($routes as $route) {
-            $rows[] = [$route->verb, $route->path, $route->handler . '()'];
-        }
+        usort($entries, static fn (array $a, array $b): int => [$a[1], $a[0]] <=> [$b[1], $b[0]]);
 
         $this->line();
-        $this->table($rows);
+        $this->table([['VERB', 'PATH', 'HANDLER'], ...$entries]);
         $this->line();
 
         return 0;
@@ -241,6 +258,69 @@ final class Batbelt extends Belt
     // ------------------------------------------------------------------------------
     // Private helpers below here. Commands are above.
     // ------------------------------------------------------------------------------
+
+    /**
+     * Every static page, as the url it answers => the file that serves it.
+     *
+     * Mirrors the framework's own lookup: <pages>/<path>.blade.php first, then
+     * <pages>/<path>.html, nested directories included, with the root serving
+     * index. Keep the two in step if that lookup ever changes.
+     *
+     * @return array<string, string>
+     */
+    private function pages(): array
+    {
+        $directory = $this->root('pages');
+
+        if (!is_dir($directory)) {
+            return [];
+        }
+
+        $blades = [];
+        $htmls = [];
+
+        $items = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS),
+        );
+
+        foreach ($items as $item) {
+            if (!$item->isFile()) {
+                continue;
+            }
+
+            $relative = str_replace(DIRECTORY_SEPARATOR, '/', substr($item->getPathname(), strlen($directory) + 1));
+
+            if (str_ends_with($relative, '.blade.php')) {
+                $blades[$this->pageUrl($relative, '.blade.php')] = 'pages/' . $relative;
+
+                continue;
+            }
+
+            if (str_ends_with($relative, '.html')) {
+                $htmls[$this->pageUrl($relative, '.html')] = 'pages/' . $relative;
+            }
+        }
+
+        // Union rather than merge: the framework checks .blade.php first, so a
+        // blade file wins when both spellings of the same url exist.
+        $pages = $blades + $htmls;
+
+        ksort($pages);
+
+        return $pages;
+    }
+
+    /**
+     * The url a page file answers. Only the root index is special: the
+     * framework maps "/" to index, but never treats a nested index as a
+     * directory default.
+     */
+    private function pageUrl(string $relative, string $extension): string
+    {
+        $url = substr($relative, 0, -strlen($extension));
+
+        return '/' . ($url === 'index' ? '' : $url);
+    }
 
     /**
      * Where the app keeps its cache. Asking the app beats hardcoding

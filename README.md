@@ -31,10 +31,13 @@ storage/cache/       # compiled Blade cache (writable)
 ## Add a route
 
 Every verb-prefixed public method becomes an endpoint, with the route inferred
-from the method name. Add methods to a trait in `src/Routes/`:
+from the method name. Put them on your `App` class, or group them into a trait
+under `src/Routes/` and `use` it, the way `PageRoutes` already is.
+
+`php batbelt makeRoute Product` creates the trait and wires it in for you:
 
 ```php
-// src/Routes/UserRoutes.php
+// src/Routes/ProductRoutes.php
 public function getProducts(): array        // GET /products
 {
     return ['products' => []];
@@ -45,6 +48,8 @@ public function getProduct(int $id): array  // GET /product/{id}
     return ['id' => $id];
 }
 ```
+
+`php batbelt routes` shows you everything the app answers, pages included.
 
 See the [Batframe documentation](https://github.com/michaelyousrie/batframe) for
 the full routing convention, request and response helpers, views, and config.
